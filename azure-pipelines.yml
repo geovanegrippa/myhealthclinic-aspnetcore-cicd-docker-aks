@@ -1,0 +1,184 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- none
+
+stages:
+- stage: Build
+  jobs:
+  - job: BuildJob
+    pool:
+      vmImage: 'ubuntu-20.04'
+
+    steps:
+    - task: qetza.replacetokens.replacetokens-task.replacetokens@6
+      displayName: 'Replace tokens in appsettings.json'
+      inputs:
+        root: '$(build.sourcesdirectory)/src/MyHealth.Web/'
+        sources: appsettings.json
+        tokenPattern: doubleunderscores
+        addBOM: true
+
+    - task: qetza.replacetokens.replacetokens-task.replacetokens@6
+      displayName: 'Replace tokens in mhc-aks.yaml'
+      inputs:
+        sources: 'mhc-aks.yaml'
+        tokenPattern: doubleunderscores
+        addBOM: true
+
+    - task: DockerCompose@0
+      displayName: 'Run services'
+      inputs:
+        containerregistrytype: 'Azure Container Registry'
+        azureSubscription: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+        azureContainerRegistry: '{"loginServer":"arcprdvendas001.azurecr.io", "id" : "/subscriptions/229bcccc-9566-4e9d-8d56-6c81dd959ed9/resourceGroups/rg-prd-aks-vendas-001/providers/Microsoft.ContainerRegistry/registries/arcprdvendas001"}'
+        dockerComposeFile: 'docker-compose.ci.build.yml'
+        projectName: 'aks-prod-vendas'
+        action: 'Run services'
+        detached: false
+
+    - task: DockerCompose@0
+      displayName: 'Build services'
+      inputs:
+        containerregistrytype: 'Azure Container Registry'
+        azureSubscription: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+        azureContainerRegistry: '{"loginServer":"arcprdvendas001.azurecr.io", "id" : "/subscriptions/229bcccc-9566-4e9d-8d56-6c81dd959ed9/resourceGroups/rg-prd-aks-vendas-001/providers/Microsoft.ContainerRegistry/registries/arcprdvendas001"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        projectName: 'aks-prod-vendas'
+        action: 'Build services'
+        additionalImageTags: '$(Build.BuildId)'
+
+    - task: DockerCompose@0
+      displayName: 'Push services'
+      inputs:
+        containerregistrytype: 'Azure Container Registry'
+        azureSubscription: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+        azureContainerRegistry: '{"loginServer":"arcprdvendas001.azurecr.io", "id" : "/subscriptions/229bcccc-9566-4e9d-8d56-6c81dd959ed9/resourceGroups/rg-prd-aks-vendas-001/providers/Microsoft.ContainerRegistry/registries/arcprdvendas001"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        projectName: 'aks-prod-vendas'
+        action: 'Push services'
+        additionalImageTags: '$(Build.BuildId)'
+
+    - task: DockerCompose@0
+      displayName: 'Lock services'
+      inputs:
+        containerregistrytype: 'Azure Container Registry'
+        azureSubscription: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+        azureContainerRegistry: '{"loginServer":"arcprdvendas001.azurecr.io", "id" : "/subscriptions/229bcccc-9566-4e9d-8d56-6c81dd959ed9/resourceGroups/rg-prd-aks-vendas-001/providers/Microsoft.ContainerRegistry/registries/arcprdvendas001"}'
+        dockerComposeFile: 'docker-compose.yml'
+        dockerComposeFileArgs: 'DOCKER_BUILD_SOURCE='
+        projectName: 'aks-prod-vendas'
+        action: 'Lock services'
+        outputDockerComposeFile: '$(Build.StagingDirectory)/docker-compose.yml'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Files'
+      inputs:
+        Contents: |
+         **/mhc-aks.yaml
+         **/*.dacpac
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      inputs:
+        ArtifactName: deploy
+
+- stage: Approval
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: ApprovalJob
+    pool: server
+    steps:
+    - task: ManualValidation@1
+      displayName: 'Waiting for approval'
+      inputs:
+        notifyUsers: 'azurelabs020_gmail.com#EXT#@azurelabs020gmail.onmicrosoft.com'
+        instructions: 'Aprovação necessária para prosseguir com o deploy'
+
+- stage: Deploy
+  dependsOn: Approval
+  condition: succeeded()
+
+  jobs:
+  - job: DeployJob1
+    displayName: 'DB deployment'
+    pool:
+     vmImage: 'windows-2019'
+     demands: 
+      - sqlpackage
+    steps:
+      - download: current
+        artifact: deploy
+        displayName: 'Baixar artefatos de build'
+
+      - task: SqlAzureDacpacDeployment@1
+        displayName: 'Execute Azure SQL : DacpacTask'
+        inputs:
+          azureSubscription: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+          ServerName: '$(SQLserver)'
+          DatabaseName: '$(DatabaseName)'
+          SqlUsername: ' $(SQLuser)'
+          SqlPassword: '$(SQLpassword)'
+          DacpacFile: '$(System.DefaultWorkingDirectory)/**/*.dacpac'
+          IpDetectionMethod: IPAddressRange
+          StartIpAddress: 0.0.0.0
+          EndIpAddress: 255.255.255.255
+
+
+  - job: DeployJob2
+    displayName: 'AKS deployment'
+    dependsOn: DeployJob1
+    condition: succeeded()
+    pool:
+     vmImage: 'ubuntu-20.04'
+    steps:
+      - task: DownloadBuildArtifacts@1
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'deploy'
+          downloadPath: '$(System.DefaultWorkingDirectory)'
+          cleanDestinationFolder: true
+
+      - task: KubeloginInstaller@0
+        displayName: 'Install Kubelogin latest'
+        inputs:
+         kubeloginVersion: 'latest'
+
+      - task: Kubernetes@1
+        displayName: 'Create Deployments & Services in AKS'
+        inputs:
+          connectionType: 'Azure Resource Manager'
+          azureSubscriptionEndpoint: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+          azureResourceGroup: 'rg-prd-aks-vendas-001'
+          kubernetesCluster: 'aks-prd-vendas-001'
+          command: apply
+          useConfigurationFile: true
+          configuration: '$(System.DefaultWorkingDirectory)/deploy/mhc-aks.yaml'
+          azureSubscriptionEndpointForSecrets: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+          azureContainerRegistry: '$(ACR)'
+          secretName: mysecretkey
+          versionSpec: 1.8.1
+          checkLatest: true
+
+      - task: Kubernetes@1
+        displayName: 'Update image in AKS'
+        inputs:
+          connectionType: 'Azure Resource Manager'
+          azureSubscriptionEndpoint: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+          azureResourceGroup: 'rg-prd-aks-vendas-001'
+          kubernetesCluster: 'aks-prd-vendas-001'
+          command: set
+          arguments: 'image deployments/mhc-front mhc-front=$(ACR)/myhealth.web:$(Build.BuildId)'
+          azureSubscriptionEndpointForSecrets: 'Azure subscription 1 (229bcccc-9566-4e9d-8d56-6c81dd959ed9)'
+          azureContainerRegistry: '$(ACR)'
+          secretName: mysecretkey
+          versionSpec: 1.8.1
+          checkLatest: true
